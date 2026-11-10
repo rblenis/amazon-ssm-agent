@@ -12,18 +12,18 @@
 // permissions and limitations under the License.
 
 // Package hibernation is responsible for the agent in hibernate mode.
-// It depends on health pings in an exponential backoff to check if the agent needs
-// to move to active mode.
+// While hibernating, the agent sends health pings with a doubling, jittered
+// backoff and leaves hibernation as soon as one of them succeeds.
 package hibernation
 
 import (
-	"sync"
+	"math/rand"
 	"time"
 
+	"github.com/aws/amazon-ssm-agent/agent/appconfig"
 	"github.com/aws/amazon-ssm-agent/agent/context"
 	"github.com/aws/amazon-ssm-agent/agent/health"
 	"github.com/aws/amazon-ssm-agent/agent/log/logger"
-	"github.com/carlescere/scheduler"
 	"github.com/cihub/seelog"
 )
 
@@ -32,128 +32,97 @@ type IHibernate interface {
 	ExecuteHibernation(context context.T) health.AgentState
 }
 
-type Hibernate struct {
-	sync.RWMutex
-	currentMode  health.AgentState
-	healthModule health.IHealthCheck
-	hibernateJob *scheduler.Job
-
-	currentPingInterval int
-	maxInterval         int
-	scheduleBackOff     func(m *Hibernate)
-	schedulePing        func(m *Hibernate)
-
-	seelogger seelog.LoggerInterface
-	isLogged  bool
-	done      chan struct{}
-}
-
-// modeChan is a channel that tracks the status of the agent
-var modeChan = make(chan health.AgentState, 10)
-
 const (
 	hibernateLogFile = "hibernate.log"
 	secondsInMinute  = 60
-	multiplier       = 2
-	initialPingRate  = 5 * secondsInMinute // Seconds
-	backoffRate      = 3
+
+	// initialRetryInterval is the delay before the first health ping after entering hibernation.
+	initialRetryInterval = 15 * time.Second
+	// multiplier is applied to the retry interval after every failed health ping.
+	multiplier = 2
+	// jitterFraction randomizes each wait by +/- this fraction so a fleet does not retry in lockstep.
+	jitterFraction = 0.2
 )
 
-// NewHibernateMode creates an object of type NewHibernateMode
+// Hibernate keeps the agent passive and polls the service until it is reachable again.
+type Hibernate struct {
+	healthModule health.IHealthCheck
+
+	initialInterval time.Duration
+	maxInterval     time.Duration
+
+	// Overridable for tests.
+	randFloat func() float64
+	newTimer  func(d time.Duration) *time.Timer
+
+	seelogger seelog.LoggerInterface
+}
+
+// NewHibernateMode creates an object of type Hibernate
 func NewHibernateMode(healthModule health.IHealthCheck, context context.T) *Hibernate {
 	context.Log().Debug("Initializing agent hibernate mode. Switching log to minimal logging...")
-	maxBackoffInterval := context.AppConfig().Ssm.HibernationMaxBackoffIntervalMinutes * secondsInMinute
+	maxMinutes := context.AppConfig().Ssm.HibernationMaxBackoffIntervalMinutes
+	if maxMinutes <= 0 {
+		// The config parser enforces a minimum; guard against an unparsed config so we never spin.
+		maxMinutes = appconfig.DefaultHibernationMaxBackoffIntervalMinutes
+	}
+	maxInterval := time.Duration(maxMinutes*secondsInMinute) * time.Second
+	initialInterval := initialRetryInterval
+	if maxInterval < initialInterval {
+		initialInterval = maxInterval
+	}
 	return &Hibernate{
-		healthModule:        healthModule,
-		currentMode:         health.Passive,
-		isLogged:            false,
-		currentPingInterval: initialPingRate,
-		maxInterval:         maxBackoffInterval,
-		scheduleBackOff:     scheduleBackOffStrategy,
-		schedulePing:        scheduleEmptyHealthPing,
-		done:                make(chan struct{}),
+		healthModule:    healthModule,
+		initialInterval: initialInterval,
+		maxInterval:     maxInterval,
+		randFloat:       rand.Float64,
+		newTimer:        time.NewTimer,
 	}
 }
 
-// ExecuteHibernation Starts the hibernate mode by blocking agent start and by scheduling health pings
+// ExecuteHibernation blocks until a health ping succeeds, then returns health.Active so the agent can start.
+// Pings are sent after initialInterval, then at doubling intervals capped at maxInterval, each with jitter.
+// Every ping result is acted on immediately; there is no fixed blocking window.
 func (m *Hibernate) ExecuteHibernation(context context.T) health.AgentState {
 	m.seelogger = logger.GetLogger(context.Log(), getHibernateSeelogConfig())
-	next := time.Duration(initialPingRate) * time.Second
-	m.seelogger.Info("Agent is in hibernate mode. Reducing logging. Logging will be reduced to one log per backoff period")
-	// Wait for initial ping time and then schedule health pings
-	<-time.After(next)
-	m.scheduleBackOff(m)
+	defer m.seelogger.Close()
+	m.seelogger.Infof("Agent is in hibernate mode. Retrying health check after %v, doubling up to every %v.",
+		m.initialInterval, m.maxInterval)
 
-	for {
-		status := <-modeChan
+	interval := m.initialInterval
+	for attempt := 1; ; attempt++ {
+		timer := m.newTimer(m.jitter(interval))
+		<-timer.C
+
+		status, err := m.healthModule.GetAgentState()
 		if status == health.Active {
-			// Agent mode is now active. Agent can start. Exit loop
-			close(m.done)
-			m.stopEmptyPing()
-			m.seelogger.Close()
-			return status // returning status for testing purposes.
+			m.seelogger.Infof("Health check succeeded on attempt %d. Leaving hibernate mode.", attempt)
+			return health.Active
+		}
+
+		interval = m.nextInterval(interval)
+		if err != nil {
+			// Before the cap this logs a handful of lines; at the cap, one line per max interval.
+			m.seelogger.Errorf("Health ping failed (attempt %d), next retry in about %v - %v", attempt, interval, err)
 		}
 	}
 }
 
-func (m *Hibernate) getCurrentPingInterval() int {
-	m.RLock()
-	defer m.RUnlock()
-	return m.currentPingInterval
-}
-
-func (m *Hibernate) setCurrentPingInterval(interval int) {
-	m.Lock()
-	defer m.Unlock()
-	m.currentPingInterval = interval
-}
-
-func (m *Hibernate) healthCheck() {
-	status, err := m.healthModule.GetAgentState()
-	if err != nil && !m.isLogged {
-		m.seelogger.Errorf("Health ping failed with error - %v", err.Error())
-		m.isLogged = true
+// nextInterval doubles the interval, capped at maxInterval.
+func (m *Hibernate) nextInterval(interval time.Duration) time.Duration {
+	next := interval * multiplier
+	if next > m.maxInterval || next <= 0 {
+		next = m.maxInterval
 	}
-	modeChan <- status
+	return next
 }
 
-func (m *Hibernate) stopEmptyPing() {
-	if m.hibernateJob != nil {
-		m.hibernateJob.Quit <- true
+// jitter returns interval randomized by +/- jitterFraction, never above maxInterval.
+func (m *Hibernate) jitter(interval time.Duration) time.Duration {
+	delta := (m.randFloat()*2 - 1) * jitterFraction // in [-jitterFraction, +jitterFraction)
+	wait := time.Duration(float64(interval) * (1 + delta))
+	if wait > m.maxInterval {
+		wait = m.maxInterval
 	}
-}
-
-func scheduleEmptyHealthPing(m *Hibernate) {
-	var err error
-	if m.hibernateJob, err = scheduler.Every(m.getCurrentPingInterval()).Seconds().Run(m.healthCheck); err != nil {
-		m.seelogger.Errorf("Unable to schedule health update. %v", err)
-	}
-}
-
-func scheduleBackOffStrategy(m *Hibernate) {
-	// Observe initial ping rate for an iteration instead of starting
-	// directly from the backed off rate for the first iteration
-	m.stopEmptyPing()
-	m.schedulePing(m)
-	backoffInterval := m.getCurrentPingInterval() * backoffRate
-	next := time.Duration(backoffInterval) * time.Second
-	m.seelogger.Infof("Backing off health check to every %v seconds for %v seconds.", m.getCurrentPingInterval(), backoffInterval)
-
-	select {
-	case <-m.done:
-		return
-	case <-time.After(next):
-		// Once backoff reaches the max interval, the scheduler will continue to schedule ping sets at max interval.
-		// This ensure a very low amount of logging remains in the hibernate.log
-		currentInterval := m.getCurrentPingInterval()
-		if currentInterval < m.maxInterval {
-			nextInterval := multiplier * currentInterval
-			if nextInterval > m.maxInterval {
-				nextInterval = m.maxInterval
-			}
-			m.setCurrentPingInterval(nextInterval)
-		}
-		m.isLogged = false
-		go m.scheduleBackOff(m)
-	}
+	return wait
 }
