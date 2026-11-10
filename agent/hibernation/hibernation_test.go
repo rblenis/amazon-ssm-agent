@@ -97,7 +97,7 @@ func TestHibernation_IntervalsDoubleAndCapAtMax(t *testing.T) {
 	}, timers.waits)
 }
 
-func TestHibernation_DefaultScheduleReachesOneHourCap(t *testing.T) {
+func TestHibernation_DefaultScheduleReachesCap(t *testing.T) {
 	h := &Hibernate{maxInterval: time.Duration(appconfig.DefaultHibernationMaxBackoffIntervalMinutes) * time.Minute}
 	interval := initialRetryInterval
 	var got []time.Duration

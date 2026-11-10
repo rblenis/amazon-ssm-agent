@@ -70,7 +70,7 @@ const (
 	DefaultSsmSelfUpdateFrequencyDaysMin = 1 // Minimum frequency is 1 day
 	DefaultSsmSelfUpdateFrequencyDaysMax = 7 // Maximum frequency is 7 day
 
-	DefaultHibernationMaxBackoffIntervalMinutes    = 60
+	DefaultHibernationMaxBackoffIntervalMinutes    = 5
 	DefaultHibernationMaxBackoffIntervalMinutesMin = 5
 	DefaultHibernationMaxBackoffIntervalMinutesMax = 1440
 

@@ -16,7 +16,7 @@
         "Endpoint": "",
         "HealthFrequencyMinutes": 5,
         "CustomInventoryDefaultLocation" : "",
-        "HibernationMaxBackoffIntervalMinutes" : 60,
+        "HibernationMaxBackoffIntervalMinutes" : 5,
         "AssociationLogsRetentionDurationHours" : 24,
         "RunCommandLogsRetentionDurationHours" : 336,
         "SessionLogsRetentionDurationHours" : 336,
